@@ -1,0 +1,23 @@
+# Sirve el proyecto Expo como servidor de desarrollo permanente (Metro bundler),
+# para que Expo Go se conecte desde cualquier lado sin depender de una laptop.
+# Esto NO compila una app instalada — el celular sigue cargando el código en vivo
+# desde este servidor cada vez que abre el proyecto en Expo Go.
+FROM node:20-slim
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+
+# Metro bundler + dev tools. Dokploy debe mapear este puerto al dominio.
+EXPOSE 8081
+
+# IMPORTANTE: configura esta variable en Dokploy con tu dominio real
+# (ej: https://kpimanagex.tudominio.com) para que el QR/manifest que genera
+# Expo apunte a esa URL pública en vez de una IP interna del contenedor.
+ENV EXPO_PACKAGER_PROXY_URL=""
+ENV CI=1
+
+CMD ["npx", "expo", "start", "--port", "8081"]

@@ -31,7 +31,14 @@ yarn-error.*
 *.pem
 
 # local env files
+.env
 .env*.local
+
+# EAS local credentials (si algún día firmas iOS localmente)
+credentials.json
+
+# metadata del harness de Claude Code, no es parte de la app
+.claude/
 
 # typescript
 *.tsbuildinfo
