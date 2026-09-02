@@ -2,7 +2,7 @@ import React from 'react';
 import { View, Text, Pressable, StyleSheet } from 'react-native';
 import { Feather } from '@expo/vector-icons';
 import { useTheme } from '../theme/ThemeProvider';
-import { brand } from '../theme/tokens';
+import { brand, status } from '../theme/tokens';
 import { ArqueoItem } from '../types';
 
 interface ItemRowProps {
@@ -26,9 +26,19 @@ export function ItemRow({ item, onPress }: ItemRowProps) {
         <Text style={{ color: brand.emerald, fontWeight: '900', fontSize: 13 }}>x{item.cantidad}</Text>
       </View>
       <View style={{ flex: 1 }}>
-        <Text style={[styles.codigo, { color: colors.textPrimary }]} numberOfLines={1}>
-          {item.codigo}
-        </Text>
+        <View style={styles.codigoRow}>
+          <Text style={[styles.codigo, { color: colors.textPrimary }]} numberOfLines={1}>
+            {item.codigo}
+          </Text>
+          {item.resolutionSource === 'none' && (
+            <Feather name="alert-triangle" size={12} color={status.warning} />
+          )}
+        </View>
+        {item.detalle ? (
+          <Text style={[styles.detalle, { color: colors.textMuted }]} numberOfLines={1}>
+            {item.detalle}
+          </Text>
+        ) : null}
         <View style={styles.metaRow}>
           <Text style={[styles.meta, { color: colors.textMuted }]}>{time}</Text>
           {item.comentario ? (
@@ -57,7 +67,9 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   qty: { minWidth: 40, paddingVertical: 6, borderRadius: 12, alignItems: 'center' },
+  codigoRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   codigo: { fontSize: 14, fontWeight: '800' },
+  detalle: { fontSize: 11, fontWeight: '600', marginTop: 1 },
   metaRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 2 },
   meta: { fontSize: 11, fontWeight: '600' },
   commentPill: { flexDirection: 'row', alignItems: 'center', gap: 4, flexShrink: 1 },

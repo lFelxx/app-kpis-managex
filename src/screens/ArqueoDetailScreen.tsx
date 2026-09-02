@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, StyleSheet, ScrollView, Pressable, Alert, Modal } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import { Feather } from '@expo/vector-icons';
@@ -23,9 +23,13 @@ import {
   wasModifiedAfterClose,
   reopenArqueo,
   deleteArqueo,
+  setItemStyleNumber,
 } from '../services/arqueos';
-import { generateExportFile, generatePosExportFile, shareExport, emailExport } from '../services/export';
+import { generateExportFile, generateExportFileByStyle, generatePosExportFile, shareExport, emailExport } from '../services/export';
+import { usePendingResolutions } from '../services/resolutionQueue';
 import { Arqueo, ArqueoItem, AuditLogEntry, ExportFormat, ExportMode } from '../types';
+import { groupByStyle, groupToDisplayItem, StyleGroup } from '../utils/styleGroups';
+import { StyleGroupSheet } from '../components/StyleGroupSheet';
 import { RootStackParamList } from '../navigation/types';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'ArqueoDetail'>;
@@ -52,6 +56,7 @@ export function ArqueoDetailScreen({ route, navigation }: Props) {
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameValue, setRenameValue] = useState('');
   const [itemSearch, setItemSearch] = useState('');
+  const [groupSheet, setGroupSheet] = useState<StyleGroup | null>(null);
 
   const load = useCallback(async () => {
     const a = await getArqueo(arqueoId);
@@ -71,6 +76,15 @@ export function ArqueoDetailScreen({ route, navigation }: Props) {
     }, [load])
   );
 
+  const pendingResolutions = usePendingResolutions(arqueoId);
+  const prevPendingRef = useRef(pendingResolutions);
+  useEffect(() => {
+    if (prevPendingRef.current > 0 && pendingResolutions === 0) {
+      load();
+    }
+    prevPendingRef.current = pendingResolutions;
+  }, [pendingResolutions, load]);
+
   if (!arqueo) return <ScreenBackground><View /></ScreenBackground>;
 
   const totalUnidades = items.reduce((s, i) => s + i.cantidad, 0);
@@ -78,9 +92,20 @@ export function ArqueoDetailScreen({ route, navigation }: Props) {
     ? items.filter(
         (i) =>
           i.codigo.toLowerCase().includes(itemSearch.trim().toLowerCase()) ||
+          i.styleNumber?.toLowerCase().includes(itemSearch.trim().toLowerCase()) ||
           i.comentario?.toLowerCase().includes(itemSearch.trim().toLowerCase())
       )
     : items;
+
+  const groups = arqueo.modo === 'style_beta' ? groupByStyle(filteredItems) : [];
+
+  const handleRowPress = (group: StyleGroup) => {
+    if (group.items.length > 1) {
+      setGroupSheet(group);
+    } else {
+      setSelected(group.items[0]);
+    }
+  };
 
   const handleSaveItem = async (data: { comentario: string; cantidad: number }) => {
     if (!selected) return;
@@ -89,6 +114,13 @@ export function ArqueoDetailScreen({ route, navigation }: Props) {
       { comentario: data.comentario || null, cantidad: data.cantidad },
       user?.displayName ?? 'desconocido'
     );
+    setSelected(null);
+    load();
+  };
+
+  const handleSetStyleNumber = async (value: string) => {
+    if (!selected) return;
+    await setItemStyleNumber(selected, value, user?.displayName ?? 'desconocido');
     setSelected(null);
     load();
   };
@@ -117,6 +149,26 @@ export function ArqueoDetailScreen({ route, navigation }: Props) {
         await shareExport(file);
       } else {
         await emailExport(file, `Arqueo ${arqueo.nombre} — ${new Date(arqueo.createdAt).toLocaleDateString('es-CO')}`);
+      }
+    } catch (e: any) {
+      Alert.alert('No se pudo exportar', e.message ?? 'Intenta de nuevo');
+    } finally {
+      setBusyFormat(null);
+      closeExportModal();
+    }
+  };
+
+  const doExportByStyle = async (format: ExportFormat, action: 'share' | 'email') => {
+    setBusyFormat(format);
+    try {
+      const file = await generateExportFileByStyle(arqueo, items, format);
+      if (action === 'share') {
+        await shareExport(file);
+      } else {
+        await emailExport(
+          file,
+          `Arqueo ${arqueo.nombre} — por Style Number — ${new Date(arqueo.createdAt).toLocaleDateString('es-CO')}`
+        );
       }
     } catch (e: any) {
       Alert.alert('No se pudo exportar', e.message ?? 'Intenta de nuevo');
@@ -195,6 +247,10 @@ export function ArqueoDetailScreen({ route, navigation }: Props) {
       <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 60 }}>
         <View style={styles.badgeRow}>
           <Badge label={arqueo.status} tone={arqueo.status === 'abierto' ? 'info' : 'success'} />
+          {arqueo.modo === 'style_beta' && <Badge label="Style Number (beta)" tone="warning" />}
+          {pendingResolutions > 0 && (
+            <Badge label={`${pendingResolutions} resolviéndose…`} tone="warning" />
+          )}
           {modified && <Badge label="Modificado tras cierre" tone="warning" />}
           {arqueo.zona && <Badge label={arqueo.zona} tone="neutral" />}
         </View>
@@ -244,6 +300,10 @@ export function ArqueoDetailScreen({ route, navigation }: Props) {
         )}
         {filteredItems.length === 0 && itemSearch.trim() ? (
           <Text style={[styles.emptySearchText, { color: colors.textMuted }]}>Ningún código coincide con "{itemSearch}".</Text>
+        ) : arqueo.modo === 'style_beta' ? (
+          groups.map((group) => (
+            <ItemRow key={group.key} item={groupToDisplayItem(group)} onPress={() => handleRowPress(group)} />
+          ))
         ) : (
           filteredItems.map((item) => <ItemRow key={item.id} item={item} onPress={() => setSelected(item)} />)
         )}
@@ -292,8 +352,22 @@ export function ArqueoDetailScreen({ route, navigation }: Props) {
         codigo={selected?.codigo ?? ''}
         cantidad={selected?.cantidad ?? 0}
         initialComment={selected?.comentario}
+        detalle={selected?.detalle}
+        styleNumber={selected?.styleNumber}
+        resolutionSource={selected?.resolutionSource}
         onClose={() => setSelected(null)}
         onSave={handleSaveItem}
+        onSetStyleNumber={arqueo.modo === 'style_beta' ? handleSetStyleNumber : undefined}
+      />
+
+      <StyleGroupSheet
+        visible={!!groupSheet}
+        group={groupSheet}
+        onClose={() => setGroupSheet(null)}
+        onSelectItem={(item) => {
+          setGroupSheet(null);
+          setSelected(item);
+        }}
       />
 
       <Modal visible={renameOpen} animationType="fade" transparent onRequestClose={() => setRenameOpen(false)}>
@@ -351,14 +425,37 @@ export function ArqueoDetailScreen({ route, navigation }: Props) {
                     <Feather name="archive" size={18} color="#22d3ee" />
                   </View>
                   <View style={{ flex: 1 }}>
-                    <Text style={[styles.modeTitle, { color: colors.textPrimary }]}>Formato para almacenar</Text>
+                    <Text style={[styles.modeTitle, { color: colors.textPrimary }]}>
+                      Formato para almacenar{arqueo.modo === 'style_beta' ? ' (por UPC)' : ''}
+                    </Text>
                     <Text style={[styles.modeDesc, { color: colors.textMuted }]}>
-                      Reporte completo con cantidades, comentarios, fechas y checksum de integridad. Para tu respaldo
-                      interno (Excel, CSV o TXT).
+                      Reporte completo con cantidades, comentarios, fechas y checksum de integridad — una fila por
+                      código de barras/talla. Para tu respaldo interno (Excel, CSV o TXT).
                     </Text>
                   </View>
                   <Feather name="chevron-right" size={18} color={colors.textMuted} />
                 </Pressable>
+
+                {arqueo.modo === 'style_beta' && (
+                  <Pressable
+                    onPress={() => setExportMode('completo_style')}
+                    style={[styles.modeCard, { borderColor: colors.borderLine, backgroundColor: colors.subtle }]}
+                  >
+                    <View style={[styles.modeIcon, { backgroundColor: '#8B5CF622' }]}>
+                      <Feather name="layers" size={18} color="#8B5CF6" />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={[styles.modeTitle, { color: colors.textPrimary }]}>
+                        Formato para almacenar (por Style Number)
+                      </Text>
+                      <Text style={[styles.modeDesc, { color: colors.textMuted }]}>
+                        Igual de completo, pero agrupado por referencia: una fila por Style Number con el total de
+                        unidades de todas las tallas juntas, y el detalle de qué UPCs aportaron.
+                      </Text>
+                    </View>
+                    <Feather name="chevron-right" size={18} color={colors.textMuted} />
+                  </Pressable>
+                )}
               </>
             )}
 
@@ -426,6 +523,47 @@ export function ArqueoDetailScreen({ route, navigation }: Props) {
                       </Pressable>
                       <Pressable
                         onPress={() => doExport(f.key, 'email')}
+                        disabled={busyFormat !== null}
+                        style={[styles.smallBtn, { borderColor: colors.borderLine }]}
+                      >
+                        <Feather name="mail" size={14} color={colors.textPrimary} />
+                      </Pressable>
+                    </View>
+                  </View>
+                ))}
+              </>
+            )}
+
+            {exportMode === 'completo_style' && (
+              <>
+                <View style={styles.exportHeaderRow}>
+                  <Pressable onPress={() => setExportMode(null)} hitSlop={10}>
+                    <Feather name="arrow-left" size={18} color={colors.textPrimary} />
+                  </Pressable>
+                  <Text style={[styles.exportTitle, { color: colors.textPrimary }]}>Por Style Number</Text>
+                  <View style={{ width: 18 }} />
+                </View>
+                <Text style={[styles.exportSubtitle, { color: colors.textMuted }]}>
+                  {groupByStyle(items).length} referencia{groupByStyle(items).length === 1 ? '' : 's'} · elige un
+                  formato y cómo enviarlo
+                </Text>
+
+                {FORMATS.map((f) => (
+                  <View key={f.key} style={[styles.formatRow, { borderColor: colors.borderLine }]}>
+                    <View style={styles.formatLabel}>
+                      <Feather name={f.icon} size={18} color={colors.textPrimary} />
+                      <Text style={[styles.formatText, { color: colors.textPrimary }]}>{f.label}</Text>
+                    </View>
+                    <View style={{ flexDirection: 'row', gap: 8 }}>
+                      <Pressable
+                        onPress={() => doExportByStyle(f.key, 'share')}
+                        disabled={busyFormat !== null}
+                        style={[styles.smallBtn, { borderColor: colors.borderLine }]}
+                      >
+                        <Feather name="share-2" size={14} color={colors.textPrimary} />
+                      </Pressable>
+                      <Pressable
+                        onPress={() => doExportByStyle(f.key, 'email')}
                         disabled={busyFormat !== null}
                         style={[styles.smallBtn, { borderColor: colors.borderLine }]}
                       >

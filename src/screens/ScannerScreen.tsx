@@ -2,16 +2,31 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { View, Text, StyleSheet, Pressable, FlatList, Animated, Modal, KeyboardAvoidingView, Platform, Alert } from 'react-native';
 import { CameraView, useCameraPermissions, BarcodeScanningResult, CameraMountError } from 'expo-camera';
 import * as Haptics from 'expo-haptics';
+import * as ImageManipulator from 'expo-image-manipulator';
 import { useAudioPlayer, setAudioModeAsync } from 'expo-audio';
 import { Feather } from '@expo/vector-icons';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useTheme } from '../theme/ThemeProvider';
 import { useAuthStore } from '../store/authStore';
 import { brand, radius, status } from '../theme/tokens';
-import { scanItem, getItems, updateItem, deleteItem, closeArqueo, getArqueo } from '../services/arqueos';
-import { ArqueoItem } from '../types';
+import {
+  scanItem,
+  scanItemByStyle,
+  updateItem,
+  updateItemResolution,
+  deleteItem,
+  closeArqueo,
+  getArqueo,
+  getItems,
+  setItemStyleNumber,
+} from '../services/arqueos';
+import { resolveStyleNumber, getCachedStyleNumber, resolveWithoutCache } from '../services/styleResolver';
+import { startResolution, finishResolution, usePendingResolutions } from '../services/resolutionQueue';
+import { ArqueoItem, ArqueoModo } from '../types';
+import { groupByStyle, groupToDisplayItem, StyleGroup } from '../utils/styleGroups';
 import { ItemRow } from '../components/ItemRow';
 import { CommentSheet } from '../components/CommentSheet';
+import { StyleGroupSheet } from '../components/StyleGroupSheet';
 import { GradientButton } from '../components/GradientButton';
 import { TextField } from '../components/TextField';
 import { RootStackParamList } from '../navigation/types';
@@ -20,6 +35,12 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 type Props = NativeStackScreenProps<RootStackParamList, 'Scanner'>;
 
 const RESCAN_COOLDOWN_MS = 1200;
+/** Pausa antes de tomar la foto: expo-camera no expone un evento de "ya enfocó",
+ * así que le damos este respiro breve al enfoque automático para que se asiente
+ * antes de capturar. Se mantiene corta a propósito para no sacrificar fluidez —
+ * solo se paga esta pausa la PRIMERA vez que se ve un código nuevo (con caché,
+ * el escaneo es instantáneo, igual que en modo simple). */
+const FOCUS_SETTLE_MS = 150;
 
 export function ScannerScreen({ route, navigation }: Props) {
   const { arqueoId } = route.params;
@@ -28,12 +49,22 @@ export function ScannerScreen({ route, navigation }: Props) {
   const [permission, requestPermission] = useCameraPermissions();
   const [items, setItems] = useState<ArqueoItem[]>([]);
   const [arqueoNombre, setArqueoNombre] = useState('');
+  const [arqueoModo, setArqueoModo] = useState<ArqueoModo>('simple');
+  const [focusing, setFocusing] = useState(false);
   const [selected, setSelected] = useState<ArqueoItem | null>(null);
+  const [groupSheet, setGroupSheet] = useState<StyleGroup | null>(null);
   const [manualOpen, setManualOpen] = useState(false);
   const [manualCode, setManualCode] = useState('');
   const flashAnim = useRef(new Animated.Value(0)).current;
   const [flashColor, setFlashColor] = useState<string>(brand.emerald);
   const lastScan = useRef<{ code: string; at: number }>({ code: '', at: 0 });
+  const cameraRef = useRef<CameraView>(null);
+  const processingRef = useRef(false);
+  const resolvingUpcsRef = useRef<Set<string>>(new Set());
+  const [confirmQueue, setConfirmQueue] = useState<{ itemId: number; styleNumber: string }[]>([]);
+  const pendingResolutions = usePendingResolutions(arqueoId);
+  const [retryTarget, setRetryTarget] = useState<ArqueoItem | null>(null);
+  const [retryBusy, setRetryBusy] = useState(false);
   const [paused, setPaused] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -47,7 +78,10 @@ export function ScannerScreen({ route, navigation }: Props) {
     const data = await getItems(arqueoId);
     setItems(data);
     const arqueo = await getArqueo(arqueoId);
-    if (arqueo) setArqueoNombre(arqueo.nombre);
+    if (arqueo) {
+      setArqueoNombre(arqueo.nombre);
+      setArqueoModo(arqueo.modo);
+    }
   }, [arqueoId]);
 
   useEffect(() => {
@@ -79,6 +113,26 @@ export function ScannerScreen({ route, navigation }: Props) {
     Animated.timing(flashAnim, { toValue: 0, duration: 350, useNativeDriver: true }).start();
   };
 
+  /** Toma una foto del cuadro completo (no solo el recuadro guía) y la
+   * redimensiona/comprime para que quepa en el límite gratis de OCR.space.
+   * Sin `skipProcessing` (para no perder orientación ni saltarse el enfoque
+   * final de la captura) y sin sonido de obturador. */
+  const capturePhotoForOcr = async (): Promise<string | undefined> => {
+    try {
+      const photo = await cameraRef.current?.takePictureAsync({ quality: 0.9, shutterSound: false });
+      if (!photo?.uri) return undefined;
+      const manipulated = await ImageManipulator.manipulateAsync(photo.uri, [{ resize: { width: 1200 } }], {
+        compress: 0.7,
+        format: ImageManipulator.SaveFormat.JPEG,
+        base64: true,
+      });
+      return manipulated.base64 ?? undefined;
+    } catch (e) {
+      console.log('[StyleResolver] No se pudo tomar/comprimir la foto para OCR:', e);
+      return undefined;
+    }
+  };
+
   const showScanError = (message: string) => {
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
     playBeep(errorSound);
@@ -87,6 +141,66 @@ export function ScannerScreen({ route, navigation }: Props) {
     if (errorTimer.current) clearTimeout(errorTimer.current);
     errorTimer.current = setTimeout(() => setScanError(null), 3000);
   };
+
+  const finalizeScanSuccess = useCallback((item: ArqueoItem, haptic = Haptics.ImpactFeedbackStyle.Medium) => {
+    Haptics.impactAsync(haptic);
+    playBeep(successSound);
+    flash();
+    setItems((prev) => {
+      const idx = prev.findIndex((i) => i.id === item.id);
+      if (idx === -1) return [item, ...prev];
+      const copy = [...prev];
+      copy[idx] = item;
+      return copy;
+    });
+  }, []);
+
+  /** Resuelve en SEGUNDO PLANO (no bloquea seguir escaneando el siguiente
+   * código) — la foto ya se tomó antes de soltar el bloqueo, así que sigue
+   * siendo la foto correcta de esta etiqueta aunque el celular ya se haya
+   * movido al siguiente producto para cuando esto termine. */
+  const resolveInBackground = useCallback(
+    (itemId: number, code: string, photoBase64: string | undefined) => {
+      startResolution(arqueoId, itemId);
+      resolveWithoutCache(code, photoBase64)
+        .then((resolved) =>
+          updateItemResolution(itemId, resolved, user?.displayName ?? 'desconocido').then(() => resolved)
+        )
+        .then((resolved) => {
+          load();
+          if (resolved.styleNumber && resolved.isNewStyle) {
+            setConfirmQueue((q) => [...q, { itemId, styleNumber: resolved.styleNumber! }]);
+          }
+        })
+        .catch((e) => console.log('[StyleResolver] Resolución en segundo plano falló:', e))
+        .finally(() => {
+          resolvingUpcsRef.current.delete(code);
+          finishResolution(arqueoId, itemId);
+        });
+    },
+    [arqueoId, user, load]
+  );
+
+  /** Vuelve a intentar OCR para un ítem que quedó "sin resolver" — abre la
+   * cámara enfocada solo en tomar una foto nueva, sin re-escanear el código
+   * de barras (ya se conoce el UPC del ítem). */
+  const handleRetryPhoto = useCallback((item: ArqueoItem) => {
+    setSelected(null);
+    setPaused(false);
+    setRetryTarget(item);
+  }, []);
+
+  const captureRetryPhoto = useCallback(async () => {
+    if (!retryTarget) return;
+    setRetryBusy(true);
+    try {
+      const photoBase64 = await capturePhotoForOcr();
+      resolveInBackground(retryTarget.id, retryTarget.codigo, photoBase64);
+    } finally {
+      setRetryBusy(false);
+      setRetryTarget(null);
+    }
+  }, [retryTarget, resolveInBackground]);
 
   const handleScan = useCallback(
     async (result: BarcodeScanningResult) => {
@@ -99,27 +213,62 @@ export function ScannerScreen({ route, navigation }: Props) {
         return;
       }
       if (lastScan.current.code === code && now - lastScan.current.at < RESCAN_COOLDOWN_MS) return;
+      if (processingRef.current) return; // ya hay un escaneo en la parte rápida (tomando foto)
       lastScan.current = { code, at: now };
+      processingRef.current = true;
 
       try {
-        const item = await scanItem(arqueoId, code, user?.displayName ?? 'desconocido');
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-        playBeep(successSound);
-        flash();
-        setItems((prev) => {
-          const idx = prev.findIndex((i) => i.id === item.id);
-          if (idx === -1) return [item, ...prev];
-          const copy = [...prev];
-          copy[idx] = item;
-          return copy;
-        });
+        if (arqueoModo === 'style_beta') {
+          // Escaneo repetido de un modelo ya visto: instantáneo, sin foto ni espera.
+          const cached = await getCachedStyleNumber(code);
+          if (cached) {
+            const item = await scanItemByStyle(arqueoId, code, cached, user?.displayName ?? 'desconocido');
+            finalizeScanSuccess(item);
+            return;
+          }
+          // Modelo nuevo, pero ya hay una resolución en curso para este mismo
+          // código (se escaneó otra unidad antes de que la primera terminara):
+          // solo sumamos cantidad, sin repetir foto ni gastar otra llamada de OCR/API.
+          if (resolvingUpcsRef.current.has(code)) {
+            const item = await scanItemByStyle(
+              arqueoId,
+              code,
+              { styleNumber: null, brand: null, title: null, source: 'none' },
+              user?.displayName ?? 'desconocido'
+            );
+            finalizeScanSuccess(item);
+            return;
+          }
+          // Modelo nuevo: solo se espera lo rápido (enfoque + foto). La
+          // resolución (OCR/API) corre después, sin bloquear el siguiente escaneo.
+          resolvingUpcsRef.current.add(code);
+          setFocusing(true);
+          await new Promise((r) => setTimeout(r, FOCUS_SETTLE_MS));
+          const photoBase64 = await capturePhotoForOcr();
+          setFocusing(false);
+          const item = await scanItemByStyle(
+            arqueoId,
+            code,
+            { styleNumber: null, brand: null, title: null, source: 'none' },
+            user?.displayName ?? 'desconocido'
+          );
+          finalizeScanSuccess(item);
+          resolveInBackground(item.id, code, photoBase64);
+        } else {
+          const item = await scanItem(arqueoId, code, user?.displayName ?? 'desconocido');
+          finalizeScanSuccess(item);
+        }
       } catch (e) {
         // Fallo real guardando en la base local (no un "no leyó nada").
+        resolvingUpcsRef.current.delete(code);
+        setFocusing(false);
         lastScan.current = { code: '', at: 0 };
         showScanError('No se pudo guardar ese código. Vuelve a escanearlo.');
+      } finally {
+        processingRef.current = false;
       }
     },
-    [arqueoId, user]
+    [arqueoId, user, arqueoModo, finalizeScanSuccess, resolveInBackground]
   );
 
   const totalUnidades = items.reduce((s, i) => s + i.cantidad, 0);
@@ -127,9 +276,21 @@ export function ScannerScreen({ route, navigation }: Props) {
     ? items.filter(
         (i) =>
           i.codigo.toLowerCase().includes(search.trim().toLowerCase()) ||
+          i.styleNumber?.toLowerCase().includes(search.trim().toLowerCase()) ||
           i.comentario?.toLowerCase().includes(search.trim().toLowerCase())
       )
     : items;
+
+  const groups = arqueoModo === 'style_beta' ? groupByStyle(filteredItems) : [];
+
+  const handleRowPress = (group: StyleGroup) => {
+    setPaused(true);
+    if (group.items.length > 1) {
+      setGroupSheet(group);
+    } else {
+      setSelected(group.items[0]);
+    }
+  };
 
   const handleSaveItem = async (data: { comentario: string; cantidad: number }) => {
     if (!selected) return;
@@ -155,20 +316,26 @@ export function ScannerScreen({ route, navigation }: Props) {
     setPaused(false);
   };
 
+  const handleSetStyleNumber = async (value: string) => {
+    if (!selected) return;
+    await setItemStyleNumber(selected, value, user?.displayName ?? 'desconocido');
+    setSelected(null);
+    setPaused(false);
+    load();
+  };
+
   const handleManualAdd = async () => {
     const code = manualCode.trim();
     if (!code) return;
     try {
-      const item = await scanItem(arqueoId, code, user?.displayName ?? 'desconocido');
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-      playBeep(successSound);
-      setItems((prev) => {
-        const idx = prev.findIndex((i) => i.id === item.id);
-        if (idx === -1) return [item, ...prev];
-        const copy = [...prev];
-        copy[idx] = item;
-        return copy;
-      });
+      let item: ArqueoItem;
+      if (arqueoModo === 'style_beta') {
+        const resolved = await resolveStyleNumber(code);
+        item = await scanItemByStyle(arqueoId, code, resolved, user?.displayName ?? 'desconocido');
+      } else {
+        item = await scanItem(arqueoId, code, user?.displayName ?? 'desconocido');
+      }
+      finalizeScanSuccess(item, Haptics.ImpactFeedbackStyle.Light);
       setManualCode('');
       setManualOpen(false);
     } catch (e) {
@@ -179,6 +346,24 @@ export function ScannerScreen({ route, navigation }: Props) {
   };
 
   const handleFinish = async () => {
+    if (pendingResolutions > 0) {
+      Alert.alert(
+        'Resoluciones en curso',
+        `Todavía hay ${pendingResolutions} código${pendingResolutions === 1 ? '' : 's'} identificándose en segundo plano. Si cierras ahora, puede que queden marcados "sin resolver" — podrás corregirlos a mano después.`,
+        [
+          { text: 'Esperar', style: 'cancel' },
+          {
+            text: 'Cerrar de todas formas',
+            style: 'destructive',
+            onPress: async () => {
+              await closeArqueo(arqueoId, user?.displayName ?? 'desconocido');
+              navigation.replace('ArqueoDetail', { arqueoId });
+            },
+          },
+        ]
+      );
+      return;
+    }
     await closeArqueo(arqueoId, user?.displayName ?? 'desconocido');
     navigation.replace('ArqueoDetail', { arqueoId });
   };
@@ -202,13 +387,14 @@ export function ScannerScreen({ route, navigation }: Props) {
       <View style={styles.cameraWrap}>
         {!paused && !cameraError && (
           <CameraView
+            ref={cameraRef}
             style={StyleSheet.absoluteFill}
             facing="back"
             enableTorch={torchOn}
             barcodeScannerSettings={{
               barcodeTypes: ['ean13', 'ean8', 'upc_a', 'upc_e', 'code39', 'code93', 'code128', 'qr', 'itf14'],
             }}
-            onBarcodeScanned={handleScan}
+            onBarcodeScanned={retryTarget ? undefined : handleScan}
             onMountError={(e: CameraMountError) => setCameraError(e.message || 'No se pudo iniciar la cámara.')}
           />
         )}
@@ -238,13 +424,50 @@ export function ScannerScreen({ route, navigation }: Props) {
           </View>
         )}
 
+        {focusing && (
+          <View style={styles.resolvingBanner}>
+            <Feather name="loader" size={14} color="#fff" />
+            <Text style={styles.errorBannerText}>Enfocando…</Text>
+          </View>
+        )}
+
+        {confirmQueue.length > 0 && (
+          <View style={styles.confirmBanner}>
+            <Feather name="tag" size={16} color="#fff" />
+            <View style={{ flex: 1 }}>
+              <Text style={styles.confirmBannerTitle}>Nuevo style number leído</Text>
+              <Text style={styles.confirmBannerValue}>{confirmQueue[0].styleNumber}</Text>
+            </View>
+            <Pressable
+              onPress={() => setConfirmQueue((q) => q.slice(1))}
+              style={[styles.confirmBtn, { backgroundColor: `${brand.emerald}CC` }]}
+            >
+              <Feather name="check" size={16} color="#fff" />
+            </Pressable>
+            <Pressable
+              onPress={() => {
+                const pendingItem = confirmQueue[0];
+                const item = items.find((i) => i.id === pendingItem.itemId);
+                setConfirmQueue((q) => q.slice(1));
+                if (item) {
+                  setPaused(true);
+                  setSelected(item);
+                }
+              }}
+              style={[styles.confirmBtn, { backgroundColor: 'rgba(255,255,255,0.2)' }]}
+            >
+              <Feather name="edit-2" size={16} color="#fff" />
+            </Pressable>
+          </View>
+        )}
+
         <SafeAreaView style={styles.topBar} edges={['top']}>
           <Pressable onPress={() => navigation.goBack()} style={styles.iconBtn}>
             <Feather name="chevron-left" size={22} color="#fff" />
           </Pressable>
           <View style={styles.topBadge}>
             <Text style={styles.topBadgeText} numberOfLines={1}>
-              {arqueoNombre}
+              {arqueoModo === 'style_beta' ? `⚡ ${arqueoNombre}` : arqueoNombre}
             </Text>
           </View>
           <View style={{ flexDirection: 'row', gap: 8 }}>
@@ -260,7 +483,45 @@ export function ScannerScreen({ route, navigation }: Props) {
           </View>
         </SafeAreaView>
 
-        {!cameraError && <View style={styles.scanFrame} pointerEvents="none" />}
+        {!cameraError && !retryTarget && <View style={styles.scanFrame} pointerEvents="none" />}
+
+        {!cameraError && !focusing && !retryTarget && arqueoModo === 'style_beta' && (
+          <View style={styles.focusHint} pointerEvents="none">
+            <Feather name="crosshair" size={12} color="#fff" />
+            <Text style={styles.focusHintText}>Mantén la etiqueta quieta y bien enfocada</Text>
+          </View>
+        )}
+
+        {!cameraError && retryTarget && (
+          <View style={styles.retryOverlay} pointerEvents="box-none">
+            <View style={styles.retryTopHint}>
+              <Text style={styles.retryTopHintText} numberOfLines={1}>
+                Nueva foto para: {retryTarget.codigo}
+              </Text>
+            </View>
+            <View style={styles.retryControls}>
+              <Pressable
+                onPress={() => setRetryTarget(null)}
+                disabled={retryBusy}
+                style={[styles.retryCancelBtn, { opacity: retryBusy ? 0.5 : 1 }]}
+              >
+                <Feather name="x" size={20} color="#fff" />
+              </Pressable>
+              <Pressable
+                onPress={captureRetryPhoto}
+                disabled={retryBusy}
+                style={[styles.retryShutterBtn, { opacity: retryBusy ? 0.6 : 1 }]}
+              >
+                {retryBusy ? (
+                  <Feather name="loader" size={26} color="#000" />
+                ) : (
+                  <Feather name="camera" size={26} color="#000" />
+                )}
+              </Pressable>
+              <View style={{ width: 44 }} />
+            </View>
+          </View>
+        )}
       </View>
 
       <View style={[styles.sheet, { backgroundColor: colors.background }]}>
@@ -271,6 +532,14 @@ export function ScannerScreen({ route, navigation }: Props) {
             <Text style={[styles.summaryValue, { color: colors.textPrimary }]}>
               {items.length} <Text style={styles.summarySub}>({totalUnidades} u.)</Text>
             </Text>
+            {pendingResolutions > 0 && (
+              <View style={styles.pendingPill}>
+                <Feather name="loader" size={10} color={status.warning} />
+                <Text style={[styles.pendingPillText, { color: status.warning }]}>
+                  {pendingResolutions} resolviéndose
+                </Text>
+              </View>
+            )}
           </View>
           <GradientButton label="Finalizar arqueo" onPress={handleFinish} disabled={items.length === 0} />
         </View>
@@ -286,27 +555,45 @@ export function ScannerScreen({ route, navigation }: Props) {
           </View>
         )}
 
-        <FlatList
-          data={filteredItems}
-          keyExtractor={(i) => String(i.id)}
-          contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 10, paddingBottom: 30 }}
-          renderItem={({ item }) => (
-            <ItemRow
-              item={item}
-              onPress={() => {
-                setPaused(true);
-                setSelected(item);
-              }}
-            />
-          )}
-          ListEmptyComponent={
-            <Text style={[styles.emptyHint, { color: colors.textMuted }]}>
-              {items.length === 0
-                ? 'Apunta la cámara a un código de barras para empezar.'
-                : 'Ningún código coincide con la búsqueda.'}
-            </Text>
-          }
-        />
+        {arqueoModo === 'style_beta' ? (
+          <FlatList
+            data={groups}
+            keyExtractor={(g) => g.key}
+            contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 10, paddingBottom: 30 }}
+            renderItem={({ item: group }) => (
+              <ItemRow item={groupToDisplayItem(group)} onPress={() => handleRowPress(group)} />
+            )}
+            ListEmptyComponent={
+              <Text style={[styles.emptyHint, { color: colors.textMuted }]}>
+                {items.length === 0
+                  ? 'Apunta la cámara a un código de barras para empezar.'
+                  : 'Ningún código coincide con la búsqueda.'}
+              </Text>
+            }
+          />
+        ) : (
+          <FlatList
+            data={filteredItems}
+            keyExtractor={(i) => String(i.id)}
+            contentContainerStyle={{ paddingHorizontal: 20, paddingTop: 10, paddingBottom: 30 }}
+            renderItem={({ item }) => (
+              <ItemRow
+                item={item}
+                onPress={() => {
+                  setPaused(true);
+                  setSelected(item);
+                }}
+              />
+            )}
+            ListEmptyComponent={
+              <Text style={[styles.emptyHint, { color: colors.textMuted }]}>
+                {items.length === 0
+                  ? 'Apunta la cámara a un código de barras para empezar.'
+                  : 'Ningún código coincide con la búsqueda.'}
+              </Text>
+            }
+          />
+        )}
       </View>
 
       <CommentSheet
@@ -314,12 +601,30 @@ export function ScannerScreen({ route, navigation }: Props) {
         codigo={selected?.codigo ?? ''}
         cantidad={selected?.cantidad ?? 0}
         initialComment={selected?.comentario}
+        detalle={selected?.detalle}
+        styleNumber={selected?.styleNumber}
+        resolutionSource={selected?.resolutionSource}
         onClose={() => {
           setSelected(null);
           setPaused(false);
         }}
         onSave={handleSaveItem}
         onDelete={handleDeleteItem}
+        onSetStyleNumber={arqueoModo === 'style_beta' ? handleSetStyleNumber : undefined}
+        onRetryPhoto={arqueoModo === 'style_beta' && selected ? () => handleRetryPhoto(selected) : undefined}
+      />
+
+      <StyleGroupSheet
+        visible={!!groupSheet}
+        group={groupSheet}
+        onClose={() => {
+          setGroupSheet(null);
+          setPaused(false);
+        }}
+        onSelectItem={(item) => {
+          setGroupSheet(null);
+          setSelected(item);
+        }}
       />
 
       <Modal visible={manualOpen} animationType="fade" transparent onRequestClose={() => setManualOpen(false)}>
@@ -384,6 +689,78 @@ const styles = StyleSheet.create({
     gap: 8,
   },
   errorBannerText: { color: '#fff', fontWeight: '700', fontSize: 12, flex: 1 },
+  resolvingBanner: {
+    position: 'absolute',
+    top: 60,
+    left: 14,
+    right: 14,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  confirmBanner: {
+    position: 'absolute',
+    top: 110,
+    left: 14,
+    right: 14,
+    backgroundColor: 'rgba(0,0,0,0.85)',
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  confirmBannerTitle: { color: '#9CA3AF', fontSize: 10, fontWeight: '800', textTransform: 'uppercase' },
+  confirmBannerValue: { color: '#fff', fontSize: 15, fontWeight: '900', marginTop: 1 },
+  confirmBtn: { width: 34, height: 34, borderRadius: 10, alignItems: 'center', justifyContent: 'center' },
+  pendingPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    marginTop: 4,
+  },
+  pendingPillText: { fontSize: 10, fontWeight: '800' },
+  retryOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    justifyContent: 'space-between',
+    paddingBottom: 24,
+  },
+  retryTopHint: {
+    alignSelf: 'center',
+    marginTop: 100,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    borderRadius: 999,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  retryTopHintText: { color: '#fff', fontWeight: '800', fontSize: 12 },
+  retryControls: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 30,
+  },
+  retryCancelBtn: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  retryShutterBtn: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   topBar: {
     position: 'absolute',
     top: 0,
@@ -421,6 +798,20 @@ const styles = StyleSheet.create({
     borderColor: brand.emerald,
     borderRadius: radius.md,
   },
+  focusHint: {
+    position: 'absolute',
+    bottom: 14,
+    left: 14,
+    right: 14,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    borderRadius: 999,
+    paddingVertical: 6,
+  },
+  focusHintText: { color: '#fff', fontSize: 11, fontWeight: '700' },
   sheet: { flex: 1, borderTopLeftRadius: radius.xl, borderTopRightRadius: radius.xl, marginTop: -20 },
   sheetHandle: { width: 40, height: 4, borderRadius: 2, backgroundColor: '#9CA3AF44', alignSelf: 'center', marginTop: 10 },
   summaryRow: {
