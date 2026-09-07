@@ -2,6 +2,17 @@
 # para que Expo Go se conecte desde cualquier lado sin depender de una laptop.
 # Esto NO compila una app instalada — el celular sigue cargando el código en vivo
 # desde este servidor cada vez que abre el proyecto en Expo Go.
+#
+# IMPORTANTE — persistencia de datos escaneados:
+# Expo Go guarda su SQLite local (AsyncStorage, etc.) bajo un "scope" que
+# depende de la sesión/identidad con la que se conectó a este servidor. La
+# carpeta ".expo/" (generada por `expo start`, normalmente NO versionada)
+# guarda esa identidad de sesión. Si cada deploy reconstruye la imagen desde
+# cero SIN esa carpeta, Expo Go puede tratar cada deploy como "otro proyecto"
+# y los arqueos ya escaneados en el teléfono quedan huérfanos (parecen borrados,
+# aunque probablemente sigan en el dispositivo bajo la sesión vieja).
+# Por eso: configura en Dokploy un VOLUMEN PERSISTENTE montado en /app/.expo,
+# para que esa identidad de sesión sobreviva entre deploys.
 FROM node:20-slim
 
 WORKDIR /app
@@ -11,12 +22,17 @@ RUN npm install
 
 COPY . .
 
+# Punto de montaje para el volumen persistente de Dokploy (ver nota arriba).
+VOLUME ["/app/.expo"]
+
 # Metro bundler + dev tools. Dokploy debe mapear este puerto al dominio.
 EXPOSE 8081
 
-# IMPORTANTE: configura esta variable en Dokploy con tu dominio real
+# IMPORTANTE: configura esta variable en Dokploy con tu dominio real y FIJO
 # (ej: https://kpimanagex.tudominio.com) para que el QR/manifest que genera
-# Expo apunte a esa URL pública en vez de una IP interna del contenedor.
+# Expo apunte a esa URL pública en vez de una IP interna del contenedor. Si
+# queda vacía o el dominio cambia entre deploys, Expo Go puede volver a tratar
+# cada deploy como un proyecto distinto y perder de vista los datos guardados.
 ENV EXPO_PACKAGER_PROXY_URL=""
 ENV CI=1
 

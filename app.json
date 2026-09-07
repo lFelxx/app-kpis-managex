@@ -51,7 +51,9 @@
           "backgroundColor": "#0E0E0E"
         }
       ],
-      "expo-audio"
+      "expo-audio",
+      "expo-sharing",
+      "expo-status-bar"
     ]
   }
 }

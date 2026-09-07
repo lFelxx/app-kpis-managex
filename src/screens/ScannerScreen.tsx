@@ -657,7 +657,7 @@ const styles = StyleSheet.create({
   cameraWrap: { height: '46%', overflow: 'hidden', backgroundColor: '#000' },
   flashOverlay: { opacity: 0 },
   cameraErrorWrap: {
-    ...StyleSheet.absoluteFillObject,
+    ...StyleSheet.absoluteFill,
     alignItems: 'center',
     justifyContent: 'center',
     gap: 10,
@@ -726,7 +726,7 @@ const styles = StyleSheet.create({
   },
   pendingPillText: { fontSize: 10, fontWeight: '800' },
   retryOverlay: {
-    ...StyleSheet.absoluteFillObject,
+    ...StyleSheet.absoluteFill,
     justifyContent: 'space-between',
     paddingBottom: 24,
   },
